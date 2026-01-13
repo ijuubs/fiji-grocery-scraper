@@ -27,12 +27,13 @@ HEADLESS = True
 CONCURRENCY = int(os.getenv("CONCURRENCY", "3"))
 DEFAULT_STORE = os.getenv("NEWWORLD_STORE", "newworld-suva-damodar-city-id-S0017")
 
-# Capture window for initial API discovery (seconds)
 DISCOVERY_SECONDS = int(os.getenv("NEWWORLD_DISCOVERY_SECONDS", "12"))
-
-# Pagination knobs (used when we can find list endpoints that accept skip/take)
 TAKE = int(os.getenv("NEWWORLD_TAKE", "40"))
 MAX_PAGES_PER_CATEGORY = int(os.getenv("NEWWORLD_MAX_PAGES_PER_CATEGORY", "250"))
+
+# Seed categories (IMPORTANT for triggering product API calls)
+# Set in GitHub Action env: NEWWORLD_CATEGORY_IDS: "1154,1234,...."
+DEFAULT_SEED_CATEGORY_IDS = [1154]
 
 # ---------------------------
 # LOGGING
@@ -53,8 +54,7 @@ HEADERS = {
 def normalize_price(value: Optional[Any]) -> Optional[float]:
     if value is None:
         return None
-    s = str(value)
-    s = re.sub(r"[^\d.]", "", s)
+    s = re.sub(r"[^\d.]", "", str(value))
     try:
         return float(s)
     except Exception:
@@ -88,10 +88,6 @@ def strip_fragment(url: str) -> str:
     return urlunparse(parts)
 
 def set_skip_take(url: str, skip: int, take: int) -> str:
-    """
-    Many New World endpoints accept skip/take. We don't assume path;
-    we just inject/override query params when present.
-    """
     parts = list(urlparse(url))
     qs = parse_qs(parts[4])
     qs["skip"] = [str(skip)]
@@ -99,8 +95,27 @@ def set_skip_take(url: str, skip: int, take: int) -> str:
     parts[4] = urlencode(qs, doseq=True)
     return urlunparse(parts)
 
+def seed_category_urls(store: str) -> List[str]:
+    env_ids = os.getenv("NEWWORLD_CATEGORY_IDS", "").strip()
+    ids: List[int] = []
+    if env_ids:
+        for part in env_ids.split(","):
+            part = part.strip()
+            if part.isdigit():
+                ids.append(int(part))
+    if not ids:
+        ids = DEFAULT_SEED_CATEGORY_IDS
+
+    urls = []
+    for cid in ids:
+        # Use the visible category route; frontend should trigger XHR calls from here.
+        urls.append(with_store(f"{BASE_URL}/category/{cid}", store))
+        # Also try a query-based category URL that your earlier script used (often triggers list API):
+        urls.append(with_store(f"{BASE_URL}/category/{cid}?skip=0&take={TAKE}&discount=false&mixAndMatch=false&search=", store))
+    return urls
+
 # ---------------------------
-# JSON MINING (category/products) – generic heuristics
+# JSON MINING (generic heuristics)
 # ---------------------------
 def _walk(obj: Any):
     if isinstance(obj, dict):
@@ -112,44 +127,26 @@ def _walk(obj: Any):
             yield from _walk(it)
 
 def extract_category_candidates(obj: Any) -> Set[Tuple[int, str]]:
-    """
-    Try to find category objects in JSON:
-    - id/categoryId
-    - name/categoryName/title
-    """
     out: Set[Tuple[int, str]] = set()
     for d in _walk(obj):
         if not isinstance(d, dict):
             continue
-        # Common key variants
         cid = d.get("categoryId", d.get("id", d.get("CategoryId")))
         name = d.get("categoryName", d.get("name", d.get("title", d.get("CategoryName"))))
         if isinstance(cid, int) and isinstance(name, str) and 1 <= cid <= 100000 and len(name) >= 2:
-            # Filter obvious noise
             if any(bad in name.lower() for bad in ["http", "{", "}", "null"]):
                 continue
             out.add((cid, name.strip()))
     return out
 
 def extract_product_candidates(obj: Any) -> List[Dict[str, Any]]:
-    """
-    Find product-like dicts. We look for:
-    - productId/id + name/description + price-like fields
-    """
     products: List[Dict[str, Any]] = []
     for d in _walk(obj):
         if not isinstance(d, dict):
             continue
         pid = d.get("productId", d.get("id", d.get("ProductId")))
         name = d.get("name", d.get("productName", d.get("title")))
-        # price fields vary; grab any plausible
-        price = (
-            d.get("price")
-            or d.get("unitPrice")
-            or d.get("currentPrice")
-            or d.get("salePrice")
-            or d.get("Price")
-        )
+        price = d.get("price") or d.get("unitPrice") or d.get("currentPrice") or d.get("salePrice") or d.get("Price")
         if isinstance(pid, int) and isinstance(name, str) and len(name.strip()) > 1:
             products.append({"productId": pid, "name": name.strip(), "price": price, "_raw": d})
     return products
@@ -160,7 +157,6 @@ def guess_image_urls(d: Dict[str, Any]) -> List[str]:
         v = d.get(k)
         if isinstance(v, str) and v.startswith("http"):
             imgs.append(v)
-    # Sometimes arrays
     v = d.get("images")
     if isinstance(v, list):
         for it in v:
@@ -170,7 +166,6 @@ def guess_image_urls(d: Dict[str, Any]) -> List[str]:
                 u = it.get("url") or it.get("imageUrl")
                 if isinstance(u, str) and u.startswith("http"):
                     imgs.append(u)
-    # De-dupe preserve order
     seen = set()
     out = []
     for u in imgs:
@@ -180,7 +175,6 @@ def guess_image_urls(d: Dict[str, Any]) -> List[str]:
     return out[:6]
 
 def product_url_from_id(pid: int, store: str) -> str:
-    # Product pages exist at /product/<id> and /product/<id>/
     return with_store(f"{BASE_URL}/product/{pid}/", store)
 
 # ---------------------------
@@ -188,26 +182,37 @@ def product_url_from_id(pid: int, store: str) -> str:
 # ---------------------------
 class ApiCapture:
     def __init__(self) -> None:
-        self.json_urls_seen: Set[str] = set()
+        self.json_urls_seen: List[str] = []
+        self.json_url_set: Set[str] = set()
         self.category_candidates: Set[Tuple[int, str]] = set()
-        self.product_candidates: Dict[int, Dict[str, Any]] = {}  # pid -> product info
-        self.list_endpoints: Set[str] = set()  # endpoints with skip/take that return product lists
+        self.product_candidates: Dict[int, Dict[str, Any]] = {}
+        self.list_endpoints: Set[str] = set()
 
     async def on_response(self, resp: Response) -> None:
         try:
-            ct = (resp.headers.get("content-type") or "").lower()
-            if "json" not in ct:
-                return
-
             url = strip_fragment(resp.url)
-            if url in self.json_urls_seen:
+
+            # Try parsing JSON even if content-type is weird
+            ct = (resp.headers.get("content-type") or "").lower()
+            if "json" not in ct and "application/" in ct:
+                # Still allow parsing if URL looks like API-ish
+                if not any(x in url.lower() for x in ["api", "product", "category", "search", "graphql"]):
+                    return
+
+            if url in self.json_url_set:
                 return
-            self.json_urls_seen.add(url)
+            self.json_url_set.add(url)
+            self.json_urls_seen.append(url)
 
-            # Parse JSON
-            data = await resp.json()
+            # Prefer resp.json(); fallback to text->json if needed
+            try:
+                data = await resp.json()
+            except Exception:
+                txt = await resp.text()
+                if not txt or len(txt) > 2_000_000:
+                    return
+                data = json.loads(txt)
 
-            # Mine categories/products from any JSON we see
             cats = extract_category_candidates(data)
             if cats:
                 before = len(self.category_candidates)
@@ -226,7 +231,6 @@ class ApiCapture:
                 if added:
                     logger.info(f"Captured products: +{added} (total {len(self.product_candidates)})")
 
-            # Detect list endpoints (if URL already uses skip/take and yielded products)
             parsed = urlparse(url)
             qs = parse_qs(parsed.query)
             if "skip" in qs and "take" in qs and prods:
@@ -237,7 +241,6 @@ class ApiCapture:
             return
 
 async def seed_store(context: BrowserContext, store: str) -> None:
-    # Correct Playwright Python init script usage (single script string)
     await context.add_init_script(script=f"""
 (() => {{
   const store = {json.dumps(store)};
@@ -256,35 +259,33 @@ async def discovery_phase(context: BrowserContext, capture: ApiCapture) -> None:
 
     logger.info(f"Discovery: loading homepage with store={DEFAULT_STORE}")
     await page.goto(with_store(HOME_URL, DEFAULT_STORE), wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(1500)
 
-    # Click around lightly to trigger API calls (SPA menus)
-    # If selectors don't exist, no problem — we still capture whatever loads.
-    try:
-        await page.wait_for_timeout(2000)
-        # Try opening menu/category links if present
-        for _ in range(3):
-            await page.mouse.wheel(0, 1200)
-            await page.wait_for_timeout(800)
-    except Exception:
-        pass
+    # Visit seed category URLs to FORCE the SPA to call product/category APIs
+    seeds = seed_category_urls(DEFAULT_STORE)
+    logger.info(f"Discovery: visiting {len(seeds)} seed category URLs to trigger XHR...")
+    for u in seeds:
+        try:
+            logger.info(f"Discovery seed visit: {u}")
+            await page.goto(u, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(2500)
+            # light scroll to trigger lazy load
+            await page.mouse.wheel(0, 1600)
+            await page.wait_for_timeout(1000)
+        except Exception as e:
+            logger.warning(f"Seed visit failed: {e}")
 
     logger.info(f"Discovery: waiting {DISCOVERY_SECONDS}s to capture API traffic...")
     await page.wait_for_timeout(DISCOVERY_SECONDS * 1000)
     await page.close()
 
 async def fetch_products_via_list_endpoint(endpoint_sample: str, store: str) -> Set[int]:
-    """
-    Use a detected skip/take JSON endpoint to paginate directly with httpx.
-    We don't assume response shape; we just mine product candidates.
-    """
     logger.info("API mode: paginating via detected list endpoint (httpx)")
     p = urlparse(endpoint_sample)
     base = urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
-    # Preserve query params other than skip/take; enforce store if the endpoint uses it
     qs = parse_qs(p.query)
-    qs["store"] = [store]  # safe even if ignored
-    # Remove skip/take so we can control
+    qs["store"] = [store]
     qs.pop("skip", None)
     qs.pop("take", None)
 
@@ -309,8 +310,8 @@ async def fetch_products_via_list_endpoint(endpoint_sample: str, store: str) -> 
                 logger.info(f"No products at skip={skip}; stopping pagination")
                 break
 
-            for p in prods:
-                discovered.add(p["productId"])
+            for p3 in prods:
+                discovered.add(p3["productId"])
 
             logger.info(f"List endpoint: skip={skip} -> +{len(prods)} (total ids {len(discovered)})")
 
@@ -321,7 +322,7 @@ async def fetch_products_via_list_endpoint(endpoint_sample: str, store: str) -> 
     return discovered
 
 # ---------------------------
-# SUPABASE WRITE (raw_products)
+# SAVE
 # ---------------------------
 async def save_product_from_json(product: Dict[str, Any], store: str) -> None:
     pid = product["productId"]
@@ -336,9 +337,10 @@ async def save_product_from_json(product: Dict[str, Any], store: str) -> None:
         "price_display": str(product.get("price")) if product.get("price") is not None else None,
         "price_numeric": normalize_price(product.get("price")),
         "currency": raw.get("currency") or "FJD",
-        "categories": [],  # API may contain category names/ids; keep empty for now (can enrich later)
+        "categories": [],
         "images": guess_image_urls(raw),
-        "raw_html": json.dumps(raw, ensure_ascii=False),  # store raw JSON in raw_html field to keep schema same
+        # Keep schema unchanged; store raw JSON here for now:
+        "raw_html": json.dumps(raw, ensure_ascii=False),
         "scrape_timestamp": datetime.now(timezone.utc).isoformat(),
         "dedupe_key": generate_dedupe_key("newworld", url),
     }
@@ -353,7 +355,7 @@ async def main() -> None:
     capture = ApiCapture()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
+        browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -366,28 +368,31 @@ async def main() -> None:
         await seed_store(context, DEFAULT_STORE)
         await discovery_phase(context, capture)
 
-        logger.info(f"Discovery summary: json_urls={len(capture.json_urls_seen)} "
-                    f"categories={len(capture.category_candidates)} "
-                    f"products={len(capture.product_candidates)} "
-                    f"list_endpoints={len(capture.list_endpoints)}")
+        logger.info(
+            f"Discovery summary: json_urls={len(capture.json_url_set)} "
+            f"categories={len(capture.category_candidates)} "
+            f"products={len(capture.product_candidates)} "
+            f"list_endpoints={len(capture.list_endpoints)}"
+        )
 
-        # If we found a list endpoint, paginate via httpx (true API mode)
+        # If still empty, print captured JSON URLs so we can pinpoint the real API
+        if len(capture.product_candidates) == 0 and len(capture.json_urls_seen) > 0:
+            logger.warning("No products captured. Captured JSON URLs:")
+            for u in capture.json_urls_seen[:30]:
+                logger.warning(f"  JSON: {u}")
+
         discovered_ids: Set[int] = set()
         if capture.list_endpoints:
             sample = next(iter(capture.list_endpoints))
             discovered_ids = await fetch_products_via_list_endpoint(sample, DEFAULT_STORE)
 
-        # Merge any products already captured during discovery
         all_products: Dict[int, Dict[str, Any]] = dict(capture.product_candidates)
-
-        # If we discovered ids but not full objects, keep minimal objects (we still save)
         for pid in discovered_ids:
             if pid not in all_products:
                 all_products[pid] = {"productId": pid, "name": f"Product {pid}", "price": None, "_raw": {"productId": pid}}
 
         logger.info(f"Total product objects to save: {len(all_products)}")
 
-        # Save concurrently
         sem = asyncio.Semaphore(CONCURRENCY)
 
         async def bounded_save(prod: Dict[str, Any]) -> None:
