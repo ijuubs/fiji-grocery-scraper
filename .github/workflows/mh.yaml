@@ -1,0 +1,46 @@
+name: MH Scraper
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *" # runs daily (UTC). Change as needed.
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Debug files
+        run: |
+          pwd
+          ls -la
+          python --version
+          test -f mh_scraper.py && echo "OK: mh_scraper.py exists" || (echo "ERROR: mh_scraper.py missing" && exit 1)
+          test -f requirements.txt && echo "OK: requirements.txt exists" || (echo "ERROR: requirements.txt missing" && exit 1)
+
+      - name: Run MH scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PYTHONUNBUFFERED: "1"
+          CONCURRENCY: "5"
+          MH_MAX_PAGES_PER_CATEGORY: "250"
+          MH_MAX_CATEGORIES: "500"
+        run: |
+          python -u mh_scraper.py
