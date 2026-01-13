@@ -3,7 +3,7 @@ name: New World Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 19 * * *" # Fiji evening, stagger after RBPatel
+    - cron: "0 19 * * *"
 
 jobs:
   scrape:
@@ -27,8 +27,7 @@ jobs:
           pwd
           ls -la
           python --version
-          echo "Does newworld_scraper.py exist?"
-          test -f newworld_scraper.py && echo "YES" || (echo "NO" && exit 1)
+          test -f newworld_scraper.py && echo "YES: newworld_scraper.py exists" || (echo "NO: newworld_scraper.py missing" && exit 1)
 
       - name: Run scraper
         env:
@@ -37,5 +36,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
           NEWWORLD_STORE: newworld-suva-damodar-city-id-S0017
           CONCURRENCY: "3"
+          NEWWORLD_DISCOVERY_SECONDS: "12"
+          NEWWORLD_TAKE: "40"
         run: |
           python -u newworld_scraper.py
