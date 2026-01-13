@@ -3,14 +3,15 @@ name: New World Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 19 * * *"
+    - cron: "0 19 * * *" # Fiji evening (UTC = 07:00). Stagger after RBPatel.
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -19,6 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           playwright install chromium
 
@@ -27,16 +29,24 @@ jobs:
           pwd
           ls -la
           python --version
-          test -f newworld_scraper.py && echo "YES: newworld_scraper.py exists" || (echo "NO: newworld_scraper.py missing" && exit 1)
+          echo "Checking required files..."
+          test -f newworld_scraper.py && echo "OK: newworld_scraper.py exists" || (echo "ERROR: newworld_scraper.py missing" && exit 1)
+          test -f requirements.txt && echo "OK: requirements.txt exists" || (echo "ERROR: requirements.txt missing" && exit 1)
 
-      - name: Run scraper
+      - name: Run New World scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           PYTHONUNBUFFERED: "1"
-          NEWWORLD_STORE: newworld-suva-damodar-city-id-S0017
-          CONCURRENCY: "3"
+
+          # New World settings
+          NEWWORLD_STORE: "newworld-suva-damodar-city-id-S0017"
+          NEWWORLD_CATEGORY_IDS: "1154" # comma-separated when you add more, e.g. "1154,1201,1302"
           NEWWORLD_DISCOVERY_SECONDS: "12"
           NEWWORLD_TAKE: "40"
+          NEWWORLD_MAX_PAGES_PER_CATEGORY: "250"
+
+          # Scraper settings
+          CONCURRENCY: "3"
         run: |
           python -u newworld_scraper.py
