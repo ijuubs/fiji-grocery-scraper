@@ -125,6 +125,7 @@ async def discover_categories(page: Page) -> List[str]:
     We try best-effort DOM discovery; otherwise fallback to seed IDs.
     """
     logger.info("Discovering New World categories from home page...")
+    categories: List[str] = []
     try:
         await page.goto(with_store(HOME_URL, DEFAULT_STORE), wait_until="networkidle", timeout=60000)
 
@@ -143,5 +144,23 @@ async def discover_categories(page: Page) -> List[str]:
         categories = [c for c in categories if re.search(r"/category/\d+", c)]
 
         logger.info(f"Discovered {len(categories)} categories")
-        if categories:
-            return
+    except Exception as e:
+        logger.warning(f"Category discovery error (DOM): {e}")
+
+    # Fallback if nothing found
+    if not categories:
+        env_ids = os.getenv("NEWWORLD_CATEGORY_IDS", "").strip()
+        ids: List[int] = []
+        if env_ids:
+            for part in env_ids.split(","):
+                part = part.strip()
+                if part.isdigit():
+                    ids.append(int(part))
+        if not ids:
+            ids = FALLBACK_CATEGORY_IDS
+
+        logger.warning(f"No categories discovered from DOM. Using fallback seed category IDs: {ids}")
+        for cid in ids:
+            categories.append(with_store(f"{BASE_URL}/category/{cid}", DEFAULT_STORE))
+
+    return categories
