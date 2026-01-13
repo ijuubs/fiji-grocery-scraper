@@ -3,7 +3,7 @@ name: New World Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 19 * * *" # stagger after RBPatel
+    - cron: "0 19 * * *" # Fiji evening, stagger after RBPatel
 
 jobs:
   scrape:
@@ -22,10 +22,20 @@ jobs:
           pip install -r requirements.txt
           playwright install chromium
 
+      - name: Debug repo files
+        run: |
+          pwd
+          ls -la
+          python --version
+          echo "Does newworld_scraper.py exist?"
+          test -f newworld_scraper.py && echo "YES" || (echo "NO" && exit 1)
+
       - name: Run scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           PYTHONUNBUFFERED: "1"
+          NEWWORLD_STORE: newworld-suva-damodar-city-id-S0017
+          CONCURRENCY: "3"
         run: |
           python -u newworld_scraper.py
