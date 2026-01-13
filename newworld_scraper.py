@@ -114,6 +114,24 @@ def normalize_abs_url(href: str) -> Optional[str]:
         return f"{BASE_URL}{href}"
     return f"{BASE_URL}/{href.lstrip('/')}"
 
+def ensure_query_param(url: str, key: str, value: str) -> str:
+    """Add/replace a query param safely."""
+    try:
+        u = urlparse(url)
+        q = parse_qs(u.query)
+        q[key] = [value]
+        new_q = urlencode({k: v[0] for k, v in q.items()}, doseq=False)
+        return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+    except Exception:
+        joiner = "&" if "?" in url else "?"
+        return knowing_append(url, joiner, key, value)
+
+def knowing_append(url: str, joiner: str, key: str, value: str) -> str:
+    # tiny helper for ensure_query_param fallback
+    if f"{key}=" in url:
+        return url
+    return f"{url}{joiner}{key}={value}"
+
 # ---------------------------------------------------
 # CATEGORY DISCOVERY
 # ---------------------------------------------------
@@ -124,28 +142,33 @@ async def discover_categories(page: Page) -> List[str]:
     We discover them by reading the rendered DOM after JS loads.
     """
     logger.info("Discovering New World categories from home page...")
-    await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=90000)
 
-    # Give SPA a moment to render menu
-    await page.wait_for_timeout(3000)
+    # NOTE: New World prompts for store selection in a modal. We try to pre-seed
+    # likely localStorage keys (set in main via add_init_script) and also pass the
+    # store in the URL to maximize chance of hydrated content.
+    await page.goto(ensure_query_param(HOME_URL, "store", DEFAULT_STORE), wait_until="domcontentloaded", timeout=90000)
 
+    # Give SPA a moment to render menus
+    await page.wait_for_timeout(4000)
+
+    # 1) DOM-based discovery
     links = await page.evaluate("""() => {
         const anchors = Array.from(document.querySelectorAll('a[href*="/category/"]'));
-        return anchors.map(a => a.href);
+        return anchors.map(a => a.getAttribute('href'));
     }""")
 
-    # Filter to canonical category pages and strip noisy params except skip/take/search/discount/mixAndMatch
     cats: Set[str] = set()
-    for url in links:
-        if not url:
-            continue
-        if "/category/" not in url:
-            continue
-        absu = normalize_abs_url(url)
-        if not absu:
-            continue
-        # Keep URL as-is; pagination function will manage skip/take
-        cats.add(absu)
+    for href in (links or []):
+        absu = normalize_abs_url(href)
+        if absu and "/category/" in absu:
+            cats.add(absu)
+
+    # 2) Regex fallback: in some runs the SPA keeps category links out of the DOM
+    # but they still appear inside JS state in the page HTML.
+    if not cats:
+        html = await page.content()
+        for cid in set(re.findall(r"/category/(\d+)", html)):
+            cats.add(f"{CATEGORY_URL_PREFIX}{cid}")
 
     categories = sorted(cats)
     logger.info(f"Discovered {len(categories)} categories")
@@ -165,6 +188,9 @@ async def crawl_category_pagination(page: Page, category_url: str) -> List[str]:
 
     product_urls: Set[str] = set()
 
+    # Ensure store param is present (listing pages are store-dependent, often via cookie/localStorage).
+    category_url = ensure_query_param(category_url, "store", DEFAULT_STORE)
+
     # Parse base + existing params, then override skip/take.
     u = urlparse(category_url)
     params = parse_qs(u.query)
@@ -182,16 +208,25 @@ async def crawl_category_pagination(page: Page, category_url: str) -> List[str]:
         url = urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
         logger.info(f"Loading category page {page_idx + 1} (skip={skip}, take={take}): {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        await page.goto(url, wait_until="networkidle", timeout=90000)
         await page.wait_for_timeout(1500)
 
-        # Product cards typically link to /product/<id>
+        # Product links can be:
+        # - real anchors (<a href="/product/1234">)
+        # - router links that still render as anchors
+        # - buried in JS state (HTML contains "/product/1234") even if DOM is minimal
         hrefs: List[str] = await page.evaluate("""() => {
             const anchors = Array.from(document.querySelectorAll('a[href*="/product/"]'));
             return anchors.map(a => a.getAttribute('href'));
         }""")
+        hrefs = [h for h in (hrefs or []) if h]
 
-        hrefs = [h for h in hrefs if h]
+        if not hrefs:
+            html = await page.content()
+            # capture both /product/1234 and /product/1234/ forms
+            ids = set(re.findall(r"/product/(\d+)", html))
+            hrefs = [f"/product/{pid}" for pid in ids]
+
         if not hrefs:
             logger.info(f"No product links found at skip={skip}. Stopping pagination.")
             break
@@ -393,6 +428,31 @@ async def main():
             ),
             viewport={"width": 1280, "height": 720},
         )
+
+        # Pre-seed likely SPA store-selection keys so category pages render products.
+        # The app may use one (or more) of these keys depending on build.
+        await context.add_init_script(
+            """(store) => {
+                try {
+                    localStorage.setItem('store', store);
+                    localStorage.setItem('selectedStore', store);
+                    localStorage.setItem('selected_store', store);
+                    localStorage.setItem('currentStore', store);
+                } catch (e) {}
+            }""",
+            DEFAULT_STORE,
+        )
+
+        # Warm-up navigation: hit a product page with store param so any cookies/session
+        # that the backend expects are created before we crawl categories.
+        warm = await context.new_page()
+        try:
+            await warm.goto(f"{BASE_URL}/product/50?store={DEFAULT_STORE}", wait_until="domcontentloaded", timeout=90000)
+            await warm.wait_for_timeout(1500)
+        except Exception:
+            pass
+        finally:
+            await warm.close()
 
         # 1) Discover categories
         page = await context.new_page()
