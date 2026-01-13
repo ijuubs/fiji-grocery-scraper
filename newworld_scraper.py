@@ -431,15 +431,17 @@ async def main():
 
         # Pre-seed likely SPA store-selection keys so category pages render products.
         # The app may use one (or more) of these keys depending on build.
-        await context.add_init_script(
-            """(store) => {
-                try {
-                    localStorage.setItem('store', store);
-                    localStorage.setItem('selectedStore', store);
-                    localStorage.setItem('selected_store', store);
-                    localStorage.setItem('currentStore', store);
-                } catch (e) {}
-            }""",
+        await context.add_init_script(script=f"""
+(() => {{
+  const store = {json.dumps(DEFAULT_STORE)};
+  try {{
+    localStorage.setItem('store', store);
+    localStorage.setItem('selectedStore', store);
+    localStorage.setItem('selected_store', store);
+    localStorage.setItem('currentStore', store);
+  }} catch (e) {{}}
+}})();
+""")
             DEFAULT_STORE,
         )
 
