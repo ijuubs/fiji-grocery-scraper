@@ -97,47 +97,43 @@ async def discover_categories(page: Page) -> List[str]:
 # ---------------------------------------------------
 
 async def crawl_category_pagination(page: Page, category_url: str) -> List[str]:
-    logger.info(f"Crawling category: {category_url}")
-    await page.goto(category_url, wait_until="domcontentloaded", timeout=60000)
+    logger.info(f"Crawling category with forced pagination: {category_url}")
 
     product_urls: Set[str] = set()
-    visited_pages: Set[str] = set()
-    current_url = page.url
+    page_number = 1
+    MAX_PAGES = 100  # safety brake
 
-    MAX_PAGES = 500
-    page_count = 0
+    while page_number <= MAX_PAGES:
+        if page_number == 1:
+            url = category_url
+        else:
+            url = f"{category_url.rstrip('/')}/page/{page_number}/"
 
-    while page_count < MAX_PAGES:
-        page_count += 1
-        visited_pages.add(current_url)
+        logger.info(f"Loading page {page_number}: {url}")
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        products = await page.query_selector_all("a.woocommerce-LoopProduct-link")
+        products = await page.query_selector_all(
+            "a.woocommerce-LoopProduct-link"
+        )
+
+        if not products:
+            logger.info(
+                f"No products found on page {page_number}, stopping pagination."
+            )
+            break
+
         before = len(product_urls)
-
         for p in products:
             href = await p.get_attribute("href")
             if href:
                 product_urls.add(href)
 
         logger.info(
-            f"Page {page_count}: +{len(product_urls) - before} products "
+            f"Page {page_number}: +{len(product_urls) - before} products "
             f"(total {len(product_urls)})"
         )
 
-        next_btn = await page.query_selector(
-            "a.next.page-numbers, a[rel='next']"
-        )
-
-        if not next_btn:
-            break
-
-        next_href = await next_btn.get_attribute("href")
-
-        if not next_href or next_href in visited_pages or next_href == current_url:
-            break
-
-        await page.goto(next_href, wait_until="domcontentloaded", timeout=30000)
-        current_url = page.url
+        page_number += 1
 
     return list(product_urls)
 
