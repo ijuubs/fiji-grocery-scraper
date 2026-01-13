@@ -23,9 +23,9 @@ jobs:
           playwright install chromium
 
       - name: Run scraper
-  env:
-    SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-    SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-    PYTHONUNBUFFERED: "1"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PYTHONUNBUFFERED: "1"
         run: |
-         python -u newworld_scraper.py
+          python -u newworld_scraper.py
