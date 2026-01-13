@@ -5,61 +5,59 @@ import json
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Set, Any
-from urllib.parse import urljoin, urlparse, urlencode, parse_qs, urlunparse
+from typing import Dict, Any, Optional, List, Set, Tuple
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 import httpx
-from playwright.async_api import async_playwright, Page, BrowserContext, Response
+from playwright.async_api import async_playwright, BrowserContext, Page, Response
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-print("BOOT: newworld_scraper.py started", flush=True)
+print("BOOT: newworld API-harvester scraper started", flush=True)
 
-# ------------------------------------------------------------
+# ---------------------------
 # CONFIG
-# ------------------------------------------------------------
+# ---------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-HEADLESS = True
-CONCURRENCY = int(os.getenv("CONCURRENCY", "3"))
 
 BASE_URL = "https://www.newworld.com.fj"
 HOME_URL = f"{BASE_URL}/"
 
-# Store selection is critical on New World (catalog/prices depend on it)
+HEADLESS = True
+CONCURRENCY = int(os.getenv("CONCURRENCY", "3"))
 DEFAULT_STORE = os.getenv("NEWWORLD_STORE", "newworld-suva-damodar-city-id-S0017")
 
-# Fallback category IDs if DOM discovery returns 0
-# You can override with: NEWWORLD_CATEGORY_IDS="1154,1234,..." (comma-separated)
-FALLBACK_CATEGORY_IDS = [1154]
+# Capture window for initial API discovery (seconds)
+DISCOVERY_SECONDS = int(os.getenv("NEWWORLD_DISCOVERY_SECONDS", "12"))
 
-# Pagination
+# Pagination knobs (used when we can find list endpoints that accept skip/take)
 TAKE = int(os.getenv("NEWWORLD_TAKE", "40"))
 MAX_PAGES_PER_CATEGORY = int(os.getenv("NEWWORLD_MAX_PAGES_PER_CATEGORY", "250"))
 
-# ------------------------------------------------------------
+# ---------------------------
 # LOGGING
-# ------------------------------------------------------------
+# ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("newworld")
 
-# ------------------------------------------------------------
+# ---------------------------
 # SUPABASE
-# ------------------------------------------------------------
+# ---------------------------
 HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "apikey": SUPABASE_KEY or "",
+    "Authorization": f"Bearer {SUPABASE_KEY or ''}",
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates",
 }
 
-def normalize_price(text: Optional[str]) -> Optional[float]:
-    if text is None:
+def normalize_price(value: Optional[Any]) -> Optional[float]:
+    if value is None:
         return None
-    clean = re.sub(r"[^\d.]", "", str(text))
+    s = str(value)
+    s = re.sub(r"[^\d.]", "", s)
     try:
-        return float(clean)
-    except ValueError:
+        return float(s)
+    except Exception:
         return None
 
 def generate_dedupe_key(source: str, url: str) -> str:
@@ -74,9 +72,9 @@ async def supabase_upsert(table: str, payload: Dict[str, Any]) -> None:
             logger.error(f"Supabase Error {r.status_code}: {r.text}")
         r.raise_for_status()
 
-# ------------------------------------------------------------
+# ---------------------------
 # URL HELPERS
-# ------------------------------------------------------------
+# ---------------------------
 def with_store(url: str, store: str) -> str:
     parts = list(urlparse(url))
     qs = parse_qs(parts[4])
@@ -84,331 +82,275 @@ def with_store(url: str, store: str) -> str:
     parts[4] = urlencode(qs, doseq=True)
     return urlunparse(parts)
 
-def canonicalize(url: str) -> str:
-    # Keep query (store matters), drop fragment
+def strip_fragment(url: str) -> str:
     parts = list(urlparse(url))
     parts[5] = ""
     return urlunparse(parts)
 
-def category_page_url(category_url: str, skip: int, take: int) -> str:
-    # Merge/override skip/take/search flags
-    parts = list(urlparse(category_url))
+def set_skip_take(url: str, skip: int, take: int) -> str:
+    """
+    Many New World endpoints accept skip/take. We don't assume path;
+    we just inject/override query params when present.
+    """
+    parts = list(urlparse(url))
     qs = parse_qs(parts[4])
     qs["skip"] = [str(skip)]
     qs["take"] = [str(take)]
-    qs.setdefault("discount", ["false"])
-    qs.setdefault("mixAndMatch", ["false"])
-    qs.setdefault("search", [""])
     parts[4] = urlencode(qs, doseq=True)
     return urlunparse(parts)
 
-# ------------------------------------------------------------
-# NETWORK (XHR) CAPTURE FALLBACK
-# ------------------------------------------------------------
-def _extract_product_urls_from_json(obj: Any) -> Set[str]:
+# ---------------------------
+# JSON MINING (category/products) – generic heuristics
+# ---------------------------
+def _walk(obj: Any):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            yield from _walk(it)
+
+def extract_category_candidates(obj: Any) -> Set[Tuple[int, str]]:
     """
-    Best-effort recursive scan for product URLs/paths inside JSON responses.
-    This handles cases where products render via XHR and DOM anchors are missing.
+    Try to find category objects in JSON:
+    - id/categoryId
+    - name/categoryName/title
     """
-    found: Set[str] = set()
-
-    def walk(x: Any):
-        if isinstance(x, dict):
-            # Common shapes: { products: [...] } or { items: [...] }
-            for k, v in x.items():
-                # direct url fields
-                if isinstance(v, str):
-                    if "/product/" in v:
-                        u = v
-                        if u.startswith("/"):
-                            u = urljoin(BASE_URL, u)
-                        if u.startswith("http"):
-                            found.add(canonicalize(u))
-                else:
-                    walk(v)
-        elif isinstance(x, list):
-            for it in x:
-                walk(it)
-
-    walk(obj)
-    return found
-
-async def _response_listener(response: Response, bucket: Set[str]) -> None:
-    """
-    Capture product URLs from XHR/JSON responses.
-    """
-    try:
-        ct = (response.headers.get("content-type") or "").lower()
-        url = response.url
-        # Only bother with likely data endpoints
-        if "application/json" not in ct and "json" not in ct:
-            return
-        if "category" not in url and "product" not in url and "search" not in url and "api" not in url:
-            # still could be, but avoid noise
-            return
-        data = await response.json()
-        urls = _extract_product_urls_from_json(data)
-        if urls:
-            before = len(bucket)
-            bucket.update(urls)
-            if len(bucket) != before:
-                logger.info(f"XHR capture: +{len(bucket)-before} product URLs (total {len(bucket)})")
-    except Exception:
-        return
-
-# ------------------------------------------------------------
-# DISCOVERY
-# ------------------------------------------------------------
-async def discover_categories(page: Page) -> List[str]:
-    """
-    Try to discover category URLs from DOM.
-    If none found (SPA), fallback to seed IDs.
-    """
-    logger.info("Discovering New World categories...")
-    categories: List[str] = []
-    try:
-        await page.goto(with_store(HOME_URL, DEFAULT_STORE), wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(1500)
-
-        links = await page.evaluate("""() => {
-          const a = Array.from(document.querySelectorAll('a[href*="/category/"]'));
-          return a.map(x => x.href);
-        }""")
-
-        categories = sorted({
-            canonicalize(u) for u in links
-            if isinstance(u, str) and u.startswith("http") and re.search(r"/category/\\d+", u)
-        })
-
-        logger.info(f"Discovered {len(categories)} categories from DOM")
-    except Exception as e:
-        logger.warning(f"Category discovery error (DOM): {e}")
-
-    if categories:
-        return categories
-
-    env_ids = os.getenv("NEWWORLD_CATEGORY_IDS", "").strip()
-    ids: List[int] = []
-    if env_ids:
-        for part in env_ids.split(","):
-            part = part.strip()
-            if part.isdigit():
-                ids.append(int(part))
-    if not ids:
-        ids = FALLBACK_CATEGORY_IDS
-
-    logger.warning(f"No categories discovered from DOM. Using fallback seed category IDs: {ids}")
-    return [with_store(f"{BASE_URL}/category/{cid}", DEFAULT_STORE) for cid in ids]
-
-# ------------------------------------------------------------
-# LISTING EXTRACTION (DOM + REGEX)
-# ------------------------------------------------------------
-async def extract_product_links_from_page(page: Page) -> Set[str]:
-    found: Set[str] = set()
-
-    # DOM anchors
-    try:
-        anchors = await page.evaluate("""() => {
-          const a = Array.from(document.querySelectorAll('a[href*="/product/"]'));
-          return a.map(x => x.href);
-        }""")
-        for u in anchors:
-            if isinstance(u, str) and "/product/" in u:
-                found.add(canonicalize(u))
-    except Exception:
-        pass
-
-    # Regex fallback on HTML
-    try:
-        html = await page.content()
-        for m in re.findall(r'href="([^"]*?/product/[^"]+)"', html, flags=re.IGNORECASE):
-            u = m
-            if u.startswith("/"):
-                u = urljoin(BASE_URL, u)
-            if u.startswith("http") and "/product/" in u:
-                found.add(canonicalize(u))
-    except Exception:
-        pass
-
-    return found
-
-async def crawl_category_skip_take(context: BrowserContext, category_url: str) -> List[str]:
-    """
-    Crawl category listing pages using skip/take.
-    Uses:
-      - DOM+regex extraction
-      - XHR capture fallback (response listener)
-    """
-    product_urls: Set[str] = set()
-    xhr_bucket: Set[str] = set()
-
-    page = await context.new_page()
-    try:
-        page.on("response", lambda r: asyncio.create_task(_response_listener(r, xhr_bucket)))
-
-        empty_pages = 0
-        for idx in range(MAX_PAGES_PER_CATEGORY):
-            skip = idx * TAKE
-            url = category_page_url(with_store(category_url, DEFAULT_STORE), skip=skip, take=TAKE)
-
-            logger.info(f"[Category] page={idx+1} skip={skip} take={TAKE} :: {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(2000)  # give SPA/XHR time
-
-            links = await extract_product_links_from_page(page)
-
-            # merge what we saw from XHR so far too
-            combined = set(links) | set(xhr_bucket)
-
-            if not combined:
-                empty_pages += 1
-                logger.info(f"No products found at skip={skip}. empty_pages={empty_pages}")
-                if empty_pages >= 2:
-                    logger.info("Stopping pagination due to consecutive empty pages.")
-                    break
+    out: Set[Tuple[int, str]] = set()
+    for d in _walk(obj):
+        if not isinstance(d, dict):
+            continue
+        # Common key variants
+        cid = d.get("categoryId", d.get("id", d.get("CategoryId")))
+        name = d.get("categoryName", d.get("name", d.get("title", d.get("CategoryName"))))
+        if isinstance(cid, int) and isinstance(name, str) and 1 <= cid <= 100000 and len(name) >= 2:
+            # Filter obvious noise
+            if any(bad in name.lower() for bad in ["http", "{", "}", "null"]):
                 continue
+            out.add((cid, name.strip()))
+    return out
 
-            empty_pages = 0
-            before = len(product_urls)
-            product_urls.update(combined)
-            logger.info(f"Collected +{len(product_urls)-before} (total {len(product_urls)}) product URLs")
+def extract_product_candidates(obj: Any) -> List[Dict[str, Any]]:
+    """
+    Find product-like dicts. We look for:
+    - productId/id + name/description + price-like fields
+    """
+    products: List[Dict[str, Any]] = []
+    for d in _walk(obj):
+        if not isinstance(d, dict):
+            continue
+        pid = d.get("productId", d.get("id", d.get("ProductId")))
+        name = d.get("name", d.get("productName", d.get("title")))
+        # price fields vary; grab any plausible
+        price = (
+            d.get("price")
+            or d.get("unitPrice")
+            or d.get("currentPrice")
+            or d.get("salePrice")
+            or d.get("Price")
+        )
+        if isinstance(pid, int) and isinstance(name, str) and len(name.strip()) > 1:
+            products.append({"productId": pid, "name": name.strip(), "price": price, "_raw": d})
+    return products
 
-            # Heuristic: if we only got a tiny batch, likely end
-            if len(combined) < max(10, TAKE // 4):
-                logger.info("Heuristic end: small batch, stopping category pagination.")
+def guess_image_urls(d: Dict[str, Any]) -> List[str]:
+    imgs: List[str] = []
+    for k in ["image", "imageUrl", "img", "thumbnail", "thumbnailUrl", "primaryImage"]:
+        v = d.get(k)
+        if isinstance(v, str) and v.startswith("http"):
+            imgs.append(v)
+    # Sometimes arrays
+    v = d.get("images")
+    if isinstance(v, list):
+        for it in v:
+            if isinstance(it, str) and it.startswith("http"):
+                imgs.append(it)
+            if isinstance(it, dict):
+                u = it.get("url") or it.get("imageUrl")
+                if isinstance(u, str) and u.startswith("http"):
+                    imgs.append(u)
+    # De-dupe preserve order
+    seen = set()
+    out = []
+    for u in imgs:
+        if u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out[:6]
+
+def product_url_from_id(pid: int, store: str) -> str:
+    # Product pages exist at /product/<id> and /product/<id>/
+    return with_store(f"{BASE_URL}/product/{pid}/", store)
+
+# ---------------------------
+# NETWORK CAPTURE
+# ---------------------------
+class ApiCapture:
+    def __init__(self) -> None:
+        self.json_urls_seen: Set[str] = set()
+        self.category_candidates: Set[Tuple[int, str]] = set()
+        self.product_candidates: Dict[int, Dict[str, Any]] = {}  # pid -> product info
+        self.list_endpoints: Set[str] = set()  # endpoints with skip/take that return product lists
+
+    async def on_response(self, resp: Response) -> None:
+        try:
+            ct = (resp.headers.get("content-type") or "").lower()
+            if "json" not in ct:
+                return
+
+            url = strip_fragment(resp.url)
+            if url in self.json_urls_seen:
+                return
+            self.json_urls_seen.add(url)
+
+            # Parse JSON
+            data = await resp.json()
+
+            # Mine categories/products from any JSON we see
+            cats = extract_category_candidates(data)
+            if cats:
+                before = len(self.category_candidates)
+                self.category_candidates |= cats
+                if len(self.category_candidates) > before:
+                    logger.info(f"Captured categories: +{len(self.category_candidates)-before} (total {len(self.category_candidates)})")
+
+            prods = extract_product_candidates(data)
+            if prods:
+                added = 0
+                for p in prods:
+                    pid = p["productId"]
+                    if pid not in self.product_candidates:
+                        self.product_candidates[pid] = p
+                        added += 1
+                if added:
+                    logger.info(f"Captured products: +{added} (total {len(self.product_candidates)})")
+
+            # Detect list endpoints (if URL already uses skip/take and yielded products)
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            if "skip" in qs and "take" in qs and prods:
+                self.list_endpoints.add(url)
+                logger.info(f"Detected list endpoint: {url}")
+
+        except Exception:
+            return
+
+async def seed_store(context: BrowserContext, store: str) -> None:
+    # Correct Playwright Python init script usage (single script string)
+    await context.add_init_script(script=f"""
+(() => {{
+  const store = {json.dumps(store)};
+  try {{
+    localStorage.setItem('store', store);
+    localStorage.setItem('selectedStore', store);
+    localStorage.setItem('selected_store', store);
+    localStorage.setItem('currentStore', store);
+  }} catch (e) {{}}
+}})();
+""")
+
+async def discovery_phase(context: BrowserContext, capture: ApiCapture) -> None:
+    page = await context.new_page()
+    page.on("response", lambda r: asyncio.create_task(capture.on_response(r)))
+
+    logger.info(f"Discovery: loading homepage with store={DEFAULT_STORE}")
+    await page.goto(with_store(HOME_URL, DEFAULT_STORE), wait_until="domcontentloaded", timeout=60000)
+
+    # Click around lightly to trigger API calls (SPA menus)
+    # If selectors don't exist, no problem — we still capture whatever loads.
+    try:
+        await page.wait_for_timeout(2000)
+        # Try opening menu/category links if present
+        for _ in range(3):
+            await page.mouse.wheel(0, 1200)
+            await page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    logger.info(f"Discovery: waiting {DISCOVERY_SECONDS}s to capture API traffic...")
+    await page.wait_for_timeout(DISCOVERY_SECONDS * 1000)
+    await page.close()
+
+async def fetch_products_via_list_endpoint(endpoint_sample: str, store: str) -> Set[int]:
+    """
+    Use a detected skip/take JSON endpoint to paginate directly with httpx.
+    We don't assume response shape; we just mine product candidates.
+    """
+    logger.info("API mode: paginating via detected list endpoint (httpx)")
+    p = urlparse(endpoint_sample)
+    base = urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+
+    # Preserve query params other than skip/take; enforce store if the endpoint uses it
+    qs = parse_qs(p.query)
+    qs["store"] = [store]  # safe even if ignored
+    # Remove skip/take so we can control
+    qs.pop("skip", None)
+    qs.pop("take", None)
+
+    discovered: Set[int] = set()
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for page_idx in range(MAX_PAGES_PER_CATEGORY):
+            skip = page_idx * TAKE
+            q2 = dict(qs)
+            q2["skip"] = [str(skip)]
+            q2["take"] = [str(TAKE)]
+            url = base + "?" + urlencode(q2, doseq=True)
+
+            r = await client.get(url, headers={"accept": "application/json"})
+            if r.status_code != 200:
+                logger.warning(f"List endpoint HTTP {r.status_code} at skip={skip}")
                 break
 
-    finally:
-        await page.close()
+            data = r.json()
+            prods = extract_product_candidates(data)
+            if not prods:
+                logger.info(f"No products at skip={skip}; stopping pagination")
+                break
 
-    return list(product_urls)
+            for p in prods:
+                discovered.add(p["productId"])
 
-# ------------------------------------------------------------
-# PRODUCT DETAIL EXTRACTION
-# ------------------------------------------------------------
-async def extract_product_data(page: Page, product_url: str) -> Optional[Dict[str, Any]]:
-    url = with_store(product_url, DEFAULT_STORE)
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(1500)
+            logger.info(f"List endpoint: skip={skip} -> +{len(prods)} (total ids {len(discovered)})")
 
-        html = await page.content()
+            if len(prods) < max(10, TAKE // 3):
+                logger.info("Heuristic end: small batch; stopping")
+                break
 
-        # JSON-LD first
-        json_product: Dict[str, Any] = {}
-        scripts = await page.locator("script[type='application/ld+json']").all_inner_texts()
-        for s in scripts:
-            try:
-                data = json.loads(s)
-                nodes = data.get("@graph", [data]) if isinstance(data, dict) else [data]
-                for node in nodes:
-                    if isinstance(node, dict) and node.get("@type") == "Product":
-                        json_product = node
-                        break
-                if json_product:
-                    break
-            except Exception:
-                continue
+    return discovered
 
-        name = None
-        price_raw = None
-        currency = "FJD"
-        images: List[str] = []
-        categories: List[str] = []
+# ---------------------------
+# SUPABASE WRITE (raw_products)
+# ---------------------------
+async def save_product_from_json(product: Dict[str, Any], store: str) -> None:
+    pid = product["productId"]
+    raw = product.get("_raw") or {}
+    url = product_url_from_id(pid, store)
 
-        # DOM name fallback
-        h1 = await page.query_selector("h1")
-        if h1:
-            t = (await h1.inner_text()).strip()
-            if t:
-                name = t
+    payload = {
+        "source": "newworld",
+        "product_url": url,
+        "name": product.get("name"),
+        "brand": raw.get("brand") or "New World",
+        "price_display": str(product.get("price")) if product.get("price") is not None else None,
+        "price_numeric": normalize_price(product.get("price")),
+        "currency": raw.get("currency") or "FJD",
+        "categories": [],  # API may contain category names/ids; keep empty for now (can enrich later)
+        "images": guess_image_urls(raw),
+        "raw_html": json.dumps(raw, ensure_ascii=False),  # store raw JSON in raw_html field to keep schema same
+        "scrape_timestamp": datetime.now(timezone.utc).isoformat(),
+        "dedupe_key": generate_dedupe_key("newworld", url),
+    }
+    await supabase_upsert("raw_products", payload)
 
-        # DOM price fallback (broad)
-        price_selectors = [
-            "[data-testid='product-price']",
-            ".price",
-            ".product-price",
-            "span[class*='price']",
-        ]
-        for sel in price_selectors:
-            el = await page.query_selector(sel)
-            if el:
-                t = (await el.inner_text()).strip()
-                if t and re.search(r"\d", t):
-                    price_raw = t
-                    break
-
-        # DOM images
-        img_els = await page.query_selector_all("img")
-        for img in img_els[:25]:
-            src = await img.get_attribute("src")
-            if src and src.startswith("http") and "/product" in src or "cdn" in src:
-                images.append(src)
-        images = list(dict.fromkeys(images))[:8]
-
-        # Breadcrumb categories
-        crumb = await page.query_selector_all("a[href*='/category/']")
-        for c in crumb[:15]:
-            t = (await c.inner_text()).strip()
-            if t:
-                categories.append(t)
-        categories = list(dict.fromkeys(categories))[:12]
-
-        # Merge JSON-LD when present
-        if json_product:
-            name = json_product.get("name") or name
-            offers = json_product.get("offers", {})
-            if isinstance(offers, list) and offers:
-                offers = offers[0]
-            if isinstance(offers, dict):
-                if offers.get("price") is not None:
-                    price_raw = str(offers.get("price"))
-                currency = offers.get("priceCurrency", currency)
-            img = json_product.get("image")
-            if img:
-                images = img if isinstance(img, list) else [img]
-
-        if not name:
-            return None
-
-        payload = {
-            "source": "newworld",
-            "product_url": canonicalize(url),
-            "name": name,
-            "brand": "New World",
-            "price_display": str(price_raw) if price_raw is not None else None,
-            "price_numeric": normalize_price(price_raw),
-            "currency": currency,
-            "categories": categories,
-            "images": images,
-            "raw_html": html,
-            "scrape_timestamp": datetime.now(timezone.utc).isoformat(),
-            "dedupe_key": generate_dedupe_key("newworld", canonicalize(url)),
-        }
-        return payload
-    except Exception as e:
-        logger.error(f"Failed product scrape: {url} :: {e}")
-        return None
-
-async def worker(sem: asyncio.Semaphore, context: BrowserContext, url: str) -> None:
-    async with sem:
-        page = await context.new_page()
-        try:
-            data = await extract_product_data(page, url)
-            if data:
-                await supabase_upsert("raw_products", data)
-                logger.info(f"Saved: {data['name'][:60]} ({data.get('price_numeric')})")
-        finally:
-            await page.close()
-
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
 async def main() -> None:
-    logger.info("Starting New World scraper main()")
+    logger.info("Starting New World API-harvester main()")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY environment variables")
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+
+    capture = ApiCapture()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
@@ -421,100 +363,44 @@ async def main() -> None:
             viewport={"width": 1280, "height": 720},
         )
 
-        # ✅ Correct Playwright Python usage (single script string; no JS args)
-        await context.add_init_script(script=f"""
-(() => {{
-  const store = {json.dumps(DEFAULT_STORE)};
-  try {{
-    localStorage.setItem('store', store);
-    localStorage.setItem('selectedStore', store);
-    localStorage.setItem('selected_store', store);
-    localStorage.setItem('currentStore', store);
-  }} catch (e) {{}}
-}})();
-""")
+        await seed_store(context, DEFAULT_STORE)
+        await discovery_phase(context, capture)
 
-        # Warm-up
-        warm = await context.new_page()
-        try:
-            await warm.goto(with_store(HOME_URL, DEFAULT_STORE), wait_until="domcontentloaded", timeout=60000)
-            await warm.wait_for_timeout(1500)
-        finally:
-            await warm.close()
+        logger.info(f"Discovery summary: json_urls={len(capture.json_urls_seen)} "
+                    f"categories={len(capture.category_candidates)} "
+                    f"products={len(capture.product_candidates)} "
+                    f"list_endpoints={len(capture.list_endpoints)}")
 
-        # Discover categories
-        page = await context.new_page()
-        try:
-            categories = await discover_categories(page)
-        finally:
-            await page.close()
+        # If we found a list endpoint, paginate via httpx (true API mode)
+        discovered_ids: Set[int] = set()
+        if capture.list_endpoints:
+            sample = next(iter(capture.list_endpoints))
+            discovered_ids = await fetch_products_via_list_endpoint(sample, DEFAULT_STORE)
 
-        logger.info(f"Categories to crawl: {len(categories)}")
+        # Merge any products already captured during discovery
+        all_products: Dict[int, Dict[str, Any]] = dict(capture.product_candidates)
 
-        master_urls: Set[str] = set()
-        for cat in categories:
-            try:
-                urls = await crawl_category_skip_take(context, cat)
-                master_urls.update(urls)
-                logger.info(f"After category, total unique product URLs = {len(master_urls)}")
-            except Exception as e:
-                logger.error(f"Category crawl failed: {cat} :: {e}")
+        # If we discovered ids but not full objects, keep minimal objects (we still save)
+        for pid in discovered_ids:
+            if pid not in all_products:
+                all_products[pid] = {"productId": pid, "name": f"Product {pid}", "price": None, "_raw": {"productId": pid}}
 
-        logger.info(f"Total unique product URLs discovered: {len(master_urls)}")
-        logger.info(f"Starting extraction with store={DEFAULT_STORE} and concurrency={CONCURRENCY}")
+        logger.info(f"Total product objects to save: {len(all_products)}")
 
+        # Save concurrently
         sem = asyncio.Semaphore(CONCURRENCY)
-        tasks = [worker(sem, context, u) for u in master_urls]
-        await asyncio.gather(*tasks)
+
+        async def bounded_save(prod: Dict[str, Any]) -> None:
+            async with sem:
+                try:
+                    await save_product_from_json(prod, DEFAULT_STORE)
+                    logger.info(f"Saved productId={prod['productId']}")
+                except Exception as e:
+                    logger.error(f"Save failed productId={prod.get('productId')}: {e}")
+
+        await asyncio.gather(*[bounded_save(prod) for prod in all_products.values()])
 
         await browser.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())# DISCOVERY
-# ------------------------------------------------------------
-
-async def discover_categories(page: Page) -> List[str]:
-    """
-    New World is SPA-ish; categories may not exist as direct links in DOM.
-    We try best-effort DOM discovery; otherwise fallback to seed IDs.
-    """
-    logger.info("Discovering New World categories from home page...")
-    categories: List[str] = []
-    try:
-        await page.goto(with_store(HOME_URL, DEFAULT_STORE), wait_until="networkidle", timeout=60000)
-
-        # Try to find category links in DOM
-        links = await page.evaluate("""() => {
-            const a = Array.from(document.querySelectorAll('a[href*="/category/"]'));
-            return a.map(x => x.href);
-        }""")
-
-        categories = sorted({
-            canonicalize(u) for u in links
-            if "/category/" in u and u.startswith("http")
-        })
-
-        # Filter out obvious non-category junk
-        categories = [c for c in categories if re.search(r"/category/\d+", c)]
-
-        logger.info(f"Discovered {len(categories)} categories")
-    except Exception as e:
-        logger.warning(f"Category discovery error (DOM): {e}")
-
-    # Fallback if nothing found
-    if not categories:
-        env_ids = os.getenv("NEWWORLD_CATEGORY_IDS", "").strip()
-        ids: List[int] = []
-        if env_ids:
-            for part in env_ids.split(","):
-                part = part.strip()
-                if part.isdigit():
-                    ids.append(int(part))
-        if not ids:
-            ids = FALLBACK_CATEGORY_IDS
-
-        logger.warning(f"No categories discovered from DOM. Using fallback seed category IDs: {ids}")
-        for cid in ids:
-            categories.append(with_store(f"{BASE_URL}/category/{cid}", DEFAULT_STORE))
-
-    return categories
+    asyncio.run(main())
