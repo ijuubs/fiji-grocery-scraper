@@ -3,12 +3,14 @@ name: RBPatel Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 18 * * *" # daily Fiji evening
+    - cron: "0 18 * * *" # daily Fiji evening (UTC)
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    environment: production   # 👈 THIS IS THE KEY LINE
+    environment: production
+    timeout-minutes: 120
+
     steps:
       - uses: actions/checkout@v4
 
@@ -23,11 +25,10 @@ jobs:
           playwright install chromium
 
       - name: Run scraper
-      env:  
-    SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-    SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-    PYTHONUNBUFFERED: "1"
-    CONCURRENCY: "5"
-  run: |
-    python -u rbpatel_scraper.py
-         rbpatel_scraper.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PYTHONUNBUFFERED: "1"
+          CONCURRENCY: "5"
+        run: |
+          python -u rbpatel_scraper.py
