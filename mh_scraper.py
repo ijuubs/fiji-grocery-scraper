@@ -15,33 +15,37 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 print("BOOT: mh_scraper.py started", flush=True)
 
 # -----------------------
-# CONFIG
+# CONFIG (ENV)
 # -----------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 HEADLESS = True
-CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
+CONCURRENCY = int(os.getenv("CONCURRENCY", "10"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
+
+MH_MAX_PAGES_PER_CATEGORY = int(os.getenv("MH_MAX_PAGES_PER_CATEGORY", "250"))
+MH_MAX_CATEGORIES = int(os.getenv("MH_MAX_CATEGORIES", "500"))
+MH_MAX_PRODUCTS_PER_RUN = int(os.getenv("MH_MAX_PRODUCTS_PER_RUN", "1200"))
 
 BASE_URL = "https://mh.com.fj"
 SHOP_URL = f"{BASE_URL}/shop/"
 
-MAX_PAGES_PER_CATEGORY = int(os.getenv("MH_MAX_PAGES_PER_CATEGORY", "250"))
-MAX_CATEGORIES = int(os.getenv("MH_MAX_CATEGORIES", "500"))
-
-# Optional: limit per run to avoid cancellations
-MH_MAX_PRODUCTS_PER_RUN = int(os.getenv("MH_MAX_PRODUCTS_PER_RUN", "0"))
-
+# -----------------------
+# LOGGING
+# -----------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("mh")
 
+# -----------------------
+# SUPABASE HEADERS
+# -----------------------
 RAW_HEADERS = {
     "apikey": SUPABASE_KEY or "",
     "Authorization": f"Bearer {SUPABASE_KEY or ''}",
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates",
 }
-
 HISTORY_HEADERS = {
     "apikey": SUPABASE_KEY or "",
     "Authorization": f"Bearer {SUPABASE_KEY or ''}",
@@ -64,30 +68,6 @@ def generate_dedupe_key(source: str, url: str) -> str:
     raw = f"{source}|{url}".lower().strip()
     return hashlib.sha256(raw.encode()).hexdigest()
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-async def supabase_upsert_raw(payload: Dict[str, Any]) -> None:
-    async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.post(
-            f"{SUPABASE_URL}/rest/v1/raw_products",
-            headers=RAW_HEADERS,
-            json=payload,
-        )
-        if r.status_code not in (200, 201, 204):
-            logger.error(f"Supabase raw_products error {r.status_code}: {r.text}")
-        r.raise_for_status()
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-async def supabase_insert_history(payload: Dict[str, Any]) -> None:
-    async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.post(
-            f"{SUPABASE_URL}/rest/v1/price_history",
-            headers=HISTORY_HEADERS,
-            json=payload,
-        )
-        if r.status_code not in (200, 201, 204):
-            logger.error(f"Supabase price_history error {r.status_code}: {r.text}")
-        r.raise_for_status()
-
 def _same_domain(url: str) -> bool:
     try:
         return urlparse(url).netloc.endswith("mh.com.fj")
@@ -95,7 +75,64 @@ def _same_domain(url: str) -> bool:
         return False
 
 # -----------------------
-# DISCOVERY
+# SUPABASE BATCH WRITES
+# -----------------------
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def supabase_upsert_raw_batch(client: httpx.AsyncClient, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    r = await client.post(f"{SUPABASE_URL}/rest/v1/raw_products", headers=RAW_HEADERS, json=rows)
+    if r.status_code not in (200, 201, 204):
+        logger.error(f"Supabase raw batch error {r.status_code}: {r.text}")
+    r.raise_for_status()
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def supabase_insert_history_batch(client: httpx.AsyncClient, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    r = await client.post(f"{SUPABASE_URL}/rest/v1/price_history", headers=HISTORY_HEADERS, json=rows)
+    if r.status_code not in (200, 201, 204):
+        logger.error(f"Supabase history batch error {r.status_code}: {r.text}")
+    r.raise_for_status()
+
+async def batch_flusher(queue: asyncio.Queue, client: httpx.AsyncClient) -> None:
+    raw_batch: List[Dict[str, Any]] = []
+    hist_batch: List[Dict[str, Any]] = []
+
+    while True:
+        item = await queue.get()
+        if item is None:
+            queue.task_done()
+            break
+
+        data = item
+        raw_batch.append(data)
+        hist_batch.append({
+            "dedupe_key": data["dedupe_key"],
+            "source": data["source"],
+            "product_url": data["product_url"],
+            "name": data["name"],
+            "price_numeric": data["price_numeric"],
+            "currency": data["currency"],
+            "seen_at": data["scrape_timestamp"],
+        })
+
+        if len(raw_batch) >= BATCH_SIZE:
+            await supabase_upsert_raw_batch(client, raw_batch)
+            await supabase_insert_history_batch(client, hist_batch)
+            logger.info(f"Flushed batch: raw={len(raw_batch)} history={len(hist_batch)}")
+            raw_batch.clear()
+            hist_batch.clear()
+
+        queue.task_done()
+
+    if raw_batch:
+        await supabase_upsert_raw_batch(client, raw_batch)
+        await supabase_insert_history_batch(client, hist_batch)
+        logger.info(f"Final flush: raw={len(raw_batch)} history={len(hist_batch)}")
+
+# -----------------------
+# DISCOVERY + PAGINATION
 # -----------------------
 async def discover_categories(page: Page) -> List[str]:
     logger.info(f"Discovering categories from {SHOP_URL}")
@@ -110,24 +147,19 @@ async def discover_categories(page: Page) -> List[str]:
     unique: List[str] = []
     seen = set()
     for u in links:
-        if not isinstance(u, str):
-            continue
-        if "/product-category/" not in u:
+        if not isinstance(u, str) or "/product-category/" not in u:
             continue
         u = u.split("#")[0]
         if _same_domain(u) and u not in seen:
             seen.add(u)
             unique.append(u)
 
-    if len(unique) > MAX_CATEGORIES:
-        unique = unique[:MAX_CATEGORIES]
+    if len(unique) > MH_MAX_CATEGORIES:
+        unique = unique[:MH_MAX_CATEGORIES]
 
     logger.info(f"Discovered {len(unique)} categories")
     return unique
 
-# -----------------------
-# PAGINATION + URL COLLECTION
-# -----------------------
 async def collect_product_urls_from_listing(page: Page) -> Set[str]:
     hrefs = await page.evaluate(
         """() => {
@@ -159,11 +191,9 @@ async def crawl_paginated_listing(page: Page, start_url: str) -> List[str]:
     if not start_url.endswith("/"):
         start_url += "/"
 
-    for n in range(1, MAX_PAGES_PER_CATEGORY + 1):
+    for n in range(1, MH_MAX_PAGES_PER_CATEGORY + 1):
         url = start_url if n == 1 else urljoin(start_url, f"page/{n}/")
-
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(400)
 
         batch = await collect_product_urls_from_listing(page)
         if not batch:
@@ -172,7 +202,7 @@ async def crawl_paginated_listing(page: Page, start_url: str) -> List[str]:
 
         before = len(product_urls)
         product_urls |= batch
-        logger.info(f"page={n}: +{len(product_urls)-before} products (total={len(product_urls)})")
+        logger.info(f"page={n}: +{len(product_urls)-before} (total={len(product_urls)})")
 
     return sorted(product_urls)
 
@@ -182,8 +212,6 @@ async def crawl_paginated_listing(page: Page, start_url: str) -> List[str]:
 async def extract_product_data(page: Page, url: str) -> Optional[Dict[str, Any]]:
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(250)
-
         html = await page.content()
 
         json_data: Dict[str, Any] = {}
@@ -277,37 +305,20 @@ async def extract_product_data(page: Page, url: str) -> Optional[Dict[str, Any]]
             "scrape_timestamp": ts,
             "dedupe_key": dedupe,
         }
-
     except Exception as e:
         logger.error(f"Extract failed: {url} :: {e}")
         return None
 
 # -----------------------
-# WORKERS
+# WORKER
 # -----------------------
-async def worker(sem: asyncio.Semaphore, context, url: str) -> None:
+async def worker(sem: asyncio.Semaphore, context, queue: asyncio.Queue, url: str) -> None:
     async with sem:
         page = await context.new_page()
         try:
             data = await extract_product_data(page, url)
-            if not data:
-                logger.warning(f"Skipped: {url}")
-                return
-
-            await supabase_upsert_raw(data)
-
-            await supabase_insert_history({
-                "dedupe_key": data["dedupe_key"],
-                "source": data["source"],
-                "product_url": data["product_url"],
-                "name": data["name"],
-                "price_numeric": data["price_numeric"],
-                "currency": data["currency"],
-                "seen_at": data["scrape_timestamp"],
-            })
-
-            logger.info(f"Saved: {data['name'][:50]}... ({data.get('price_numeric')})")
-
+            if data:
+                await queue.put(data)
         finally:
             await page.close()
 
@@ -318,51 +329,69 @@ async def main() -> None:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY env vars")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 720},
-        )
+    async with httpx.AsyncClient(timeout=60) as supa_client:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=HEADLESS)
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 720},
+            )
 
-        page = await context.new_page()
+            # Block heavy resources (speed!)
+            async def block_heavy(route):
+                r = route.request
+                if r.resource_type in ("image", "font", "media"):
+                    await route.abort()
+                else:
+                    await route.continue_()
 
-        categories = await discover_categories(page)
+            await context.route("**/*", block_heavy)
 
-        master_urls: Set[str] = set()
+            page = await context.new_page()
 
-        # Safety net: crawl /shop/ pages too
-        shop_urls = await crawl_paginated_listing(page, SHOP_URL)
-        master_urls |= set(shop_urls)
-        logger.info(f"After /shop crawl, master_urls={len(master_urls)}")
+            categories = await discover_categories(page)
 
-        for cat in categories:
-            try:
-                cat_urls = await crawl_paginated_listing(page, cat)
-                master_urls |= set(cat_urls)
-                logger.info(f"After category, master_urls={len(master_urls)}")
-            except Exception as e:
-                logger.error(f"Category crawl failed: {cat} :: {e}")
+            master_urls: Set[str] = set()
 
-        await page.close()
+            # Safety net: crawl /shop/ pages (captures everything)
+            shop_urls = await crawl_paginated_listing(page, SHOP_URL)
+            master_urls |= set(shop_urls)
+            logger.info(f"After /shop crawl, master_urls={len(master_urls)}")
 
-        urls = sorted(master_urls)
-        logger.info(f"Total unique product URLs discovered: {len(urls)}")
+            for cat in categories:
+                try:
+                    cat_urls = await crawl_paginated_listing(page, cat)
+                    master_urls |= set(cat_urls)
+                    logger.info(f"After category, master_urls={len(master_urls)}")
+                except Exception as e:
+                    logger.error(f"Category crawl failed: {cat} :: {e}")
 
-        # Optional cap per run to avoid cancellations
-        if MH_MAX_PRODUCTS_PER_RUN > 0:
-            urls = urls[:MH_MAX_PRODUCTS_PER_RUN]
-            logger.info(f"Processing {len(urls)} products this run (MH_MAX_PRODUCTS_PER_RUN)")
+            await page.close()
 
-        sem = asyncio.Semaphore(CONCURRENCY)
-        tasks = [worker(sem, context, u) for u in urls]
-        await asyncio.gather(*tasks)
+            urls = sorted(master_urls)
+            logger.info(f"Total unique product URLs discovered: {len(urls)}")
 
-        await browser.close()
+            # Chunking (prevents cancellations)
+            if MH_MAX_PRODUCTS_PER_RUN > 0:
+                urls = urls[:MH_MAX_PRODUCTS_PER_RUN]
+                logger.info(f"Processing {len(urls)} products this run (MH_MAX_PRODUCTS_PER_RUN)")
+
+            queue: asyncio.Queue = asyncio.Queue(maxsize=CONCURRENCY * 4)
+            flusher_task = asyncio.create_task(batch_flusher(queue, supa_client))
+
+            sem = asyncio.Semaphore(CONCURRENCY)
+            tasks = [worker(sem, context, queue, u) for u in urls]
+            await asyncio.gather(*tasks)
+
+            await queue.put(None)
+            await queue.join()
+            await flusher_task
+
+            await browser.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
