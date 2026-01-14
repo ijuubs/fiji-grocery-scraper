@@ -23,8 +23,11 @@ jobs:
           playwright install chromium
 
       - name: Run scraper
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: |
-          python rbpatel_scraper.py
+      env:  
+    SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+    SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+    PYTHONUNBUFFERED: "1"
+    CONCURRENCY: "5"
+  run: |
+    python -u rbpatel_scraper.py
+         rbpatel_scraper.py
