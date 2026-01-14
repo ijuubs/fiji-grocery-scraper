@@ -3,13 +3,13 @@ name: MH Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 20 * * *" # runs daily (UTC). Change as needed.
+    - cron: "0 20 * * *" # daily UTC
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repo
@@ -39,7 +39,13 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           PYTHONUNBUFFERED: "1"
-          CONCURRENCY: "8"
+
+          # Speed / stability tuning
+          CONCURRENCY: "10"
+          BATCH_SIZE: "100"
+          MH_MAX_PRODUCTS_PER_RUN: "1200"
+
+          # Crawl safety brakes
           MH_MAX_PAGES_PER_CATEGORY: "250"
           MH_MAX_CATEGORIES: "500"
         run: |
