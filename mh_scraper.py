@@ -28,6 +28,10 @@ MH_MAX_PAGES_PER_CATEGORY = int(os.getenv("MH_MAX_PAGES_PER_CATEGORY", "250"))
 MH_MAX_CATEGORIES = int(os.getenv("MH_MAX_CATEGORIES", "500"))
 MH_MAX_PRODUCTS_PER_RUN = int(os.getenv("MH_MAX_PRODUCTS_PER_RUN", "1200"))
 
+# If you want, you can force a store click by matching text (optional)
+# Example: "MAIN WAREHOUSE" or "MaxVal-u City"
+MH_PREFERRED_STORE_TEXT = os.getenv("MH_PREFERRED_STORE_TEXT", "").strip()
+
 BASE_URL = "https://mh.com.fj"
 SHOP_URL = f"{BASE_URL}/shop/"
 
@@ -132,11 +136,69 @@ async def batch_flusher(queue: asyncio.Queue, client: httpx.AsyncClient) -> None
         logger.info(f"Final flush: raw={len(raw_batch)} history={len(hist_batch)}")
 
 # -----------------------
+# STORE GATE HANDLING (FIX)
+# -----------------------
+async def ensure_store_selected(page: Page) -> None:
+    """
+    MH sometimes shows a "Choose your Nearest Store" gate on /shop/ (no products).
+    We click a store to set session/cookies, then continue.
+    """
+    # Quick text check (cheap + robust)
+    body_text = (await page.text_content("body")) or ""
+    if "Choose your Nearest Store" not in body_text:
+        return
+
+    logger.warning("Store selection gate detected. Attempting to select a store...")
+
+    # Try preferred store text if provided
+    if MH_PREFERRED_STORE_TEXT:
+        try:
+            loc = page.get_by_text(MH_PREFERRED_STORE_TEXT, exact=False)
+            if await loc.count() > 0:
+                await loc.first.click(timeout=8000)
+                await page.wait_for_load_state("domcontentloaded")
+                logger.info(f"Selected store (preferred): {MH_PREFERRED_STORE_TEXT}")
+                return
+        except Exception:
+            pass
+
+    # Otherwise click the first reasonable store option link/button
+    try:
+        # Heuristic: click first link in the store selection area
+        clicked = await page.evaluate("""() => {
+          const text = "Choose your Nearest Store";
+          const body = document.body;
+          if (!body || !body.innerText.includes(text)) return false;
+
+          // Find any clickable items that look like store names
+          const candidates = Array.from(document.querySelectorAll('a, button'))
+            .filter(el => el && el.innerText && el.innerText.trim().length > 0)
+            .filter(el => {
+              const t = el.innerText.trim();
+              // store-ish words seen on MH
+              return /(MAIN WAREHOUSE|MaxVal|MH |Makoi|Nadi|Lautoka|Labasa|Nausori|Suva|Navua|Lami|Rak|Sigatoka|Ba)/i.test(t);
+            });
+
+          if (candidates.length === 0) return false;
+          candidates[0].click();
+          return true;
+        }""")
+        if clicked:
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(800)
+            logger.info("Selected store (first match).")
+        else:
+            logger.warning("Could not auto-select store (no clickable candidates found).")
+    except Exception as e:
+        logger.warning(f"Store selection click failed: {e}")
+
+# -----------------------
 # DISCOVERY + PAGINATION
 # -----------------------
 async def discover_categories(page: Page) -> List[str]:
     logger.info(f"Discovering categories from {SHOP_URL}")
     await page.goto(SHOP_URL, wait_until="domcontentloaded", timeout=60000)
+    await ensure_store_selected(page)
 
     links = await page.evaluate(
         """() => Array.from(document.querySelectorAll('a[href*="/product-category/"]'))
@@ -185,21 +247,36 @@ async def collect_product_urls_from_listing(page: Page) -> Set[str]:
     return urls
 
 async def crawl_paginated_listing(page: Page, start_url: str) -> List[str]:
+    """
+    FIX: Don't stop immediately if page 1 is empty (store gate / weird landing).
+    We allow a few consecutive empty pages before stopping.
+    """
     logger.info(f"Crawling listing: {start_url}")
     product_urls: Set[str] = set()
 
     if not start_url.endswith("/"):
         start_url += "/"
 
+    empty_streak = 0
+    MAX_EMPTY_STREAK = 3  # tolerate store-gate/odd pages
+
     for n in range(1, MH_MAX_PAGES_PER_CATEGORY + 1):
         url = start_url if n == 1 else urljoin(start_url, f"page/{n}/")
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
+        # If this is /shop/ and it's the store gate, select store once
+        await ensure_store_selected(page)
+
         batch = await collect_product_urls_from_listing(page)
         if not batch:
-            logger.info(f"Listing ended (no products) at page={n}: {url}")
-            break
+            empty_streak += 1
+            logger.info(f"No products at page={n} (empty_streak={empty_streak}) :: {url}")
+            if empty_streak >= MAX_EMPTY_STREAK:
+                logger.info(f"Listing ended after {empty_streak} empty pages at page={n}")
+                break
+            continue
 
+        empty_streak = 0
         before = len(product_urls)
         product_urls |= batch
         logger.info(f"page={n}: +{len(product_urls)-before} (total={len(product_urls)})")
@@ -353,11 +430,12 @@ async def main() -> None:
 
             page = await context.new_page()
 
+            # Category discovery
             categories = await discover_categories(page)
 
             master_urls: Set[str] = set()
 
-            # Safety net: crawl /shop/ pages (captures everything)
+            # Safety net: crawl /shop/ pages too
             shop_urls = await crawl_paginated_listing(page, SHOP_URL)
             master_urls |= set(shop_urls)
             logger.info(f"After /shop crawl, master_urls={len(master_urls)}")
