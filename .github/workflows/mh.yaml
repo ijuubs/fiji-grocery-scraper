@@ -39,7 +39,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           PYTHONUNBUFFERED: "1"
-          CONCURRENCY: "5"
+          CONCURRENCY: "8"
           MH_MAX_PAGES_PER_CATEGORY: "250"
           MH_MAX_CATEGORIES: "500"
         run: |
