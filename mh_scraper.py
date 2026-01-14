@@ -28,10 +28,6 @@ MH_MAX_PAGES_PER_CATEGORY = int(os.getenv("MH_MAX_PAGES_PER_CATEGORY", "250"))
 MH_MAX_CATEGORIES = int(os.getenv("MH_MAX_CATEGORIES", "500"))
 MH_MAX_PRODUCTS_PER_RUN = int(os.getenv("MH_MAX_PRODUCTS_PER_RUN", "1200"))
 
-# If you want, you can force a store click by matching text (optional)
-# Example: "MAIN WAREHOUSE" or "MaxVal-u City"
-MH_PREFERRED_STORE_TEXT = os.getenv("MH_PREFERRED_STORE_TEXT", "").strip()
-
 BASE_URL = "https://mh.com.fj"
 SHOP_URL = f"{BASE_URL}/shop/"
 
@@ -77,6 +73,9 @@ def _same_domain(url: str) -> bool:
         return urlparse(url).netloc.endswith("mh.com.fj")
     except Exception:
         return False
+
+def _clean_url(u: str) -> str:
+    return (u or "").split("#")[0].strip()
 
 # -----------------------
 # SUPABASE BATCH WRITES
@@ -136,82 +135,45 @@ async def batch_flusher(queue: asyncio.Queue, client: httpx.AsyncClient) -> None
         logger.info(f"Final flush: raw={len(raw_batch)} history={len(hist_batch)}")
 
 # -----------------------
-# STORE GATE HANDLING (FIX)
-# -----------------------
-async def ensure_store_selected(page: Page) -> None:
-    """
-    MH sometimes shows a "Choose your Nearest Store" gate on /shop/ (no products).
-    We click a store to set session/cookies, then continue.
-    """
-    # Quick text check (cheap + robust)
-    body_text = (await page.text_content("body")) or ""
-    if "Choose your Nearest Store" not in body_text:
-        return
-
-    logger.warning("Store selection gate detected. Attempting to select a store...")
-
-    # Try preferred store text if provided
-    if MH_PREFERRED_STORE_TEXT:
-        try:
-            loc = page.get_by_text(MH_PREFERRED_STORE_TEXT, exact=False)
-            if await loc.count() > 0:
-                await loc.first.click(timeout=8000)
-                await page.wait_for_load_state("domcontentloaded")
-                logger.info(f"Selected store (preferred): {MH_PREFERRED_STORE_TEXT}")
-                return
-        except Exception:
-            pass
-
-    # Otherwise click the first reasonable store option link/button
-    try:
-        # Heuristic: click first link in the store selection area
-        clicked = await page.evaluate("""() => {
-          const text = "Choose your Nearest Store";
-          const body = document.body;
-          if (!body || !body.innerText.includes(text)) return false;
-
-          // Find any clickable items that look like store names
-          const candidates = Array.from(document.querySelectorAll('a, button'))
-            .filter(el => el && el.innerText && el.innerText.trim().length > 0)
-            .filter(el => {
-              const t = el.innerText.trim();
-              // store-ish words seen on MH
-              return /(MAIN WAREHOUSE|MaxVal|MH |Makoi|Nadi|Lautoka|Labasa|Nausori|Suva|Navua|Lami|Rak|Sigatoka|Ba)/i.test(t);
-            });
-
-          if (candidates.length === 0) return false;
-          candidates[0].click();
-          return true;
-        }""")
-        if clicked:
-            await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_timeout(800)
-            logger.info("Selected store (first match).")
-        else:
-            logger.warning("Could not auto-select store (no clickable candidates found).")
-    except Exception as e:
-        logger.warning(f"Store selection click failed: {e}")
-
-# -----------------------
-# DISCOVERY + PAGINATION
+# DISCOVERY
 # -----------------------
 async def discover_categories(page: Page) -> List[str]:
+    """
+    Prefer the sidebar category widget, then fallback to any /product-category/ links.
+    """
     logger.info(f"Discovering categories from {SHOP_URL}")
     await page.goto(SHOP_URL, wait_until="domcontentloaded", timeout=60000)
-    await ensure_store_selected(page)
 
-    links = await page.evaluate(
-        """() => Array.from(document.querySelectorAll('a[href*="/product-category/"]'))
-              .map(a => a.href)
-              .filter(Boolean)"""
-    )
+    # Wait briefly for category widget (non-fatal)
+    try:
+        await page.wait_for_selector("ul.product-categories a", timeout=8000)
+    except Exception:
+        pass
+
+    links = await page.evaluate("""() => {
+      const out = new Set();
+
+      // Sidebar widget first (most reliable)
+      document.querySelectorAll('ul.product-categories a[href*="/product-category/"]').forEach(a => {
+        if (a && a.href) out.add(a.href);
+      });
+
+      // Fallback: any category link anywhere
+      document.querySelectorAll('a[href*="/product-category/"]').forEach(a => {
+        if (a && a.href) out.add(a.href);
+      });
+
+      return Array.from(out);
+    }""")
 
     unique: List[str] = []
     seen = set()
     for u in links:
-        if not isinstance(u, str) or "/product-category/" not in u:
+        if not isinstance(u, str):
             continue
-        u = u.split("#")[0]
+        u = _clean_url(u)
+        if "/product-category/" not in u:
+            continue
         if _same_domain(u) and u not in seen:
             seen.add(u)
             unique.append(u)
@@ -222,34 +184,67 @@ async def discover_categories(page: Page) -> List[str]:
     logger.info(f"Discovered {len(unique)} categories")
     return unique
 
+# -----------------------
+# LISTING CRAWL
+# -----------------------
 async def collect_product_urls_from_listing(page: Page) -> Set[str]:
-    hrefs = await page.evaluate(
-        """() => {
-            const sels = [
-              'a.woocommerce-LoopProduct-link',
-              'a.woocommerce-loop-product__link',
-              'li.product a[href*="/product/"]'
-            ];
-            const out = new Set();
-            for (const sel of sels) {
-              document.querySelectorAll(sel).forEach(a => {
-                if (a && a.href) out.add(a.href);
-              });
-            }
-            return Array.from(out);
-        }"""
-    )
+    """
+    Very robust: grab all hrefs that include /product/ but NOT /product-category/
+    and not obvious non-product endpoints.
+    """
+    hrefs = await page.evaluate("""() => {
+      const out = new Set();
+
+      // Prefer product cards if present
+      document.querySelectorAll('li.product a[href]').forEach(a => {
+        if (a && a.href) out.add(a.href);
+      });
+
+      // Fallback: any link containing /product/
+      document.querySelectorAll('a[href*="/product/"]').forEach(a => {
+        if (a && a.href) out.add(a.href);
+      });
+
+      return Array.from(out);
+    }""")
 
     urls: Set[str] = set()
     for u in hrefs:
-        if isinstance(u, str) and _same_domain(u) and "/product/" in u:
-            urls.add(u.split("#")[0])
+        if not isinstance(u, str):
+            continue
+        u = _clean_url(u)
+        if not _same_domain(u):
+            continue
+        if "/product/" not in u:
+            continue
+        if "/product-category/" in u:
+            continue
+        # skip add-to-cart links etc
+        if "add-to-cart=" in u or "/?add-to-cart=" in u:
+            continue
+        urls.add(u)
+
     return urls
+
+async def page_has_pagination(page: Page) -> bool:
+    """
+    If there are pagination controls, we shouldn’t stop too early.
+    """
+    try:
+        return await page.evaluate("""() => {
+          const next =
+            document.querySelector('a.next.page-numbers') ||
+            document.querySelector("a[rel='next']") ||
+            document.querySelector(".woocommerce-pagination a");
+          return !!next;
+        }""")
+    except Exception:
+        return False
 
 async def crawl_paginated_listing(page: Page, start_url: str) -> List[str]:
     """
-    FIX: Don't stop immediately if page 1 is empty (store gate / weird landing).
-    We allow a few consecutive empty pages before stopping.
+    Crawl /shop/ or /product-category/... with page/N pattern.
+    Stop only after consecutive empties AND no pagination.
     """
     logger.info(f"Crawling listing: {start_url}")
     product_urls: Set[str] = set()
@@ -258,20 +253,20 @@ async def crawl_paginated_listing(page: Page, start_url: str) -> List[str]:
         start_url += "/"
 
     empty_streak = 0
-    MAX_EMPTY_STREAK = 3  # tolerate store-gate/odd pages
+    MAX_EMPTY_STREAK = 5
 
     for n in range(1, MH_MAX_PAGES_PER_CATEGORY + 1):
         url = start_url if n == 1 else urljoin(start_url, f"page/{n}/")
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        # If this is /shop/ and it's the store gate, select store once
-        await ensure_store_selected(page)
-
         batch = await collect_product_urls_from_listing(page)
         if not batch:
             empty_streak += 1
-            logger.info(f"No products at page={n} (empty_streak={empty_streak}) :: {url}")
-            if empty_streak >= MAX_EMPTY_STREAK:
+            has_pag = await page_has_pagination(page)
+            logger.info(f"No products at page={n} (empty_streak={empty_streak}, has_pagination={has_pag}) :: {url}")
+
+            # Only stop if we repeatedly see empties AND pagination seems absent
+            if empty_streak >= MAX_EMPTY_STREAK and not has_pag:
                 logger.info(f"Listing ended after {empty_streak} empty pages at page={n}")
                 break
             continue
@@ -291,6 +286,7 @@ async def extract_product_data(page: Page, url: str) -> Optional[Dict[str, Any]]
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         html = await page.content()
 
+        # JSON-LD Product
         json_data: Dict[str, Any] = {}
         scripts = await page.locator("script[type='application/ld+json']").all_inner_texts()
         for script in scripts:
@@ -312,12 +308,11 @@ async def extract_product_data(page: Page, url: str) -> Optional[Dict[str, Any]]
             dom_name = (await h1.inner_text()).strip()
 
         price_text = None
-        selectors = [
+        for sel in [
             "p.price ins span.woocommerce-Price-amount bdi",
             "p.price span.woocommerce-Price-amount bdi",
             "span.price span.woocommerce-Price-amount bdi",
-        ]
-        for sel in selectors:
+        ]:
             el = await page.query_selector(sel)
             if el:
                 t = (await el.inner_text()).strip()
@@ -430,16 +425,16 @@ async def main() -> None:
 
             page = await context.new_page()
 
-            # Category discovery
             categories = await discover_categories(page)
 
             master_urls: Set[str] = set()
 
-            # Safety net: crawl /shop/ pages too
+            # Crawl /shop/ (captures everything)
             shop_urls = await crawl_paginated_listing(page, SHOP_URL)
             master_urls |= set(shop_urls)
             logger.info(f"After /shop crawl, master_urls={len(master_urls)}")
 
+            # Crawl categories too (adds any missing)
             for cat in categories:
                 try:
                     cat_urls = await crawl_paginated_listing(page, cat)
