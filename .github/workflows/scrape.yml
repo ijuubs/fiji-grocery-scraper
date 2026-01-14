@@ -3,7 +3,7 @@ name: RBPatel Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 18 * * *" # daily Fiji evening (UTC)
+    - cron: "0 18 * * *" # daily UTC
 
 jobs:
   scrape:
@@ -12,7 +12,8 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -21,14 +22,27 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           playwright install chromium
 
-      - name: Run scraper
+      - name: Debug files
+        run: |
+          pwd
+          ls -la
+          python --version
+          test -f rbpatel_scraper.py && echo "OK: rbpatel_scraper.py exists" || (echo "ERROR: rbpatel_scraper.py missing" && exit 1)
+          test -f requirements.txt && echo "OK: requirements.txt exists" || (echo "ERROR: requirements.txt missing" && exit 1)
+
+      - name: Run RBPatel scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           PYTHONUNBUFFERED: "1"
-          CONCURRENCY: "5"
+
+          # Speed / stability tuning
+          CONCURRENCY: "8"
+          BATCH_SIZE: "100"
+          RBP_MAX_PRODUCTS_PER_RUN: "1200"
         run: |
           python -u rbpatel_scraper.py
