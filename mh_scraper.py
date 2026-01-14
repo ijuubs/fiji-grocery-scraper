@@ -21,31 +21,36 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 HEADLESS = True
-CONCURRENCY = int(os.getenv("CONCURRENCY", "5"))
+CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
 
 BASE_URL = "https://mh.com.fj"
 SHOP_URL = f"{BASE_URL}/shop/"
 
-# Safety brakes
 MAX_PAGES_PER_CATEGORY = int(os.getenv("MH_MAX_PAGES_PER_CATEGORY", "250"))
 MAX_CATEGORIES = int(os.getenv("MH_MAX_CATEGORIES", "500"))
 
-# -----------------------
-# LOGGING
-# -----------------------
+# Optional: limit per run to avoid cancellations
+MH_MAX_PRODUCTS_PER_RUN = int(os.getenv("MH_MAX_PRODUCTS_PER_RUN", "0"))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("mh")
 
-# -----------------------
-# SUPABASE
-# -----------------------
-HEADERS = {
+RAW_HEADERS = {
     "apikey": SUPABASE_KEY or "",
     "Authorization": f"Bearer {SUPABASE_KEY or ''}",
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates",
 }
 
+HISTORY_HEADERS = {
+    "apikey": SUPABASE_KEY or "",
+    "Authorization": f"Bearer {SUPABASE_KEY or ''}",
+    "Content-Type": "application/json",
+}
+
+# -----------------------
+# HELPERS
+# -----------------------
 def normalize_price(text: Optional[str]) -> Optional[float]:
     if not text:
         return None
@@ -60,26 +65,39 @@ def generate_dedupe_key(source: str, url: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-async def supabase_upsert(table: str, payload: Dict[str, Any]) -> None:
+async def supabase_upsert_raw(payload: Dict[str, Any]) -> None:
     async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=HEADERS, json=payload)
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/raw_products",
+            headers=RAW_HEADERS,
+            json=payload,
+        )
         if r.status_code not in (200, 201, 204):
-            logger.error(f"Supabase Error {r.status_code}: {r.text}")
+            logger.error(f"Supabase raw_products error {r.status_code}: {r.text}")
         r.raise_for_status()
 
-# -----------------------
-# DISCOVERY
-# -----------------------
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def supabase_insert_history(payload: Dict[str, Any]) -> None:
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/price_history",
+            headers=HISTORY_HEADERS,
+            json=payload,
+        )
+        if r.status_code not in (200, 201, 204):
+            logger.error(f"Supabase price_history error {r.status_code}: {r.text}")
+        r.raise_for_status()
+
 def _same_domain(url: str) -> bool:
     try:
         return urlparse(url).netloc.endswith("mh.com.fj")
     except Exception:
         return False
 
+# -----------------------
+# DISCOVERY
+# -----------------------
 async def discover_categories(page: Page) -> List[str]:
-    """
-    Pull category URLs from the /shop/ sidebar or any anchor containing /product-category/.
-    """
     logger.info(f"Discovering categories from {SHOP_URL}")
     await page.goto(SHOP_URL, wait_until="domcontentloaded", timeout=60000)
 
@@ -89,44 +107,34 @@ async def discover_categories(page: Page) -> List[str]:
               .filter(Boolean)"""
     )
 
-    # Deduplicate, keep only mh.com.fj
-    unique = []
+    unique: List[str] = []
     seen = set()
     for u in links:
-        if not _same_domain(u):
+        if not isinstance(u, str):
             continue
         if "/product-category/" not in u:
             continue
-        # Normalize: remove fragments
         u = u.split("#")[0]
-        if u not in seen:
+        if _same_domain(u) and u not in seen:
             seen.add(u)
             unique.append(u)
 
-    # Safety
     if len(unique) > MAX_CATEGORIES:
         unique = unique[:MAX_CATEGORIES]
 
-    logger.info(f"Discovered {len(unique)} category URLs")
+    logger.info(f"Discovered {len(unique)} categories")
     return unique
 
 # -----------------------
 # PAGINATION + URL COLLECTION
 # -----------------------
 async def collect_product_urls_from_listing(page: Page) -> Set[str]:
-    """
-    Robustly collects product links from a listing page.
-    WooCommerce commonly uses:
-      - a.woocommerce-LoopProduct-link
-      - a.woocommerce-loop-product__link
-    """
     hrefs = await page.evaluate(
         """() => {
             const sels = [
               'a.woocommerce-LoopProduct-link',
               'a.woocommerce-loop-product__link',
-              'li.product a[href*="/product/"]',
-              'a[href*="/product/"]'
+              'li.product a[href*="/product/"]'
             ];
             const out = new Set();
             for (const sel of sels) {
@@ -137,39 +145,27 @@ async def collect_product_urls_from_listing(page: Page) -> Set[str]:
             return Array.from(out);
         }"""
     )
+
     urls: Set[str] = set()
     for u in hrefs:
-        if u and _same_domain(u) and "/product/" in u:
+        if isinstance(u, str) and _same_domain(u) and "/product/" in u:
             urls.add(u.split("#")[0])
     return urls
 
 async def crawl_paginated_listing(page: Page, start_url: str) -> List[str]:
-    """
-    Crawl /page/N/ until products stop appearing.
-    Works for:
-      - category pages: /product-category/xxx/page/2/
-      - shop pages: /shop/page/2/
-    """
     logger.info(f"Crawling listing: {start_url}")
     product_urls: Set[str] = set()
 
-    # Ensure trailing slash consistency
     if not start_url.endswith("/"):
         start_url += "/"
 
     for n in range(1, MAX_PAGES_PER_CATEGORY + 1):
-        if n == 1:
-            url = start_url
-        else:
-            # WooCommerce pagination pattern
-            url = urljoin(start_url, f"page/{n}/")
+        url = start_url if n == 1 else urljoin(start_url, f"page/{n}/")
 
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(400)
 
         batch = await collect_product_urls_from_listing(page)
-
-        # If empty: stop
         if not batch:
             logger.info(f"Listing ended (no products) at page={n}: {url}")
             break
@@ -177,9 +173,6 @@ async def crawl_paginated_listing(page: Page, start_url: str) -> List[str]:
         before = len(product_urls)
         product_urls |= batch
         logger.info(f"page={n}: +{len(product_urls)-before} products (total={len(product_urls)})")
-
-        # If we keep getting very small batches, you can optionally stop early,
-        # but safest is to rely on empty page stop.
 
     return sorted(product_urls)
 
@@ -193,10 +186,8 @@ async def extract_product_data(page: Page, url: str) -> Optional[Dict[str, Any]]
 
         html = await page.content()
 
-        # JSON-LD first (Yoast/WooCommerce often places Product schema inside @graph)
         json_data: Dict[str, Any] = {}
         scripts = await page.locator("script[type='application/ld+json']").all_inner_texts()
-
         for script in scripts:
             try:
                 data = json.loads(script)
@@ -210,39 +201,35 @@ async def extract_product_data(page: Page, url: str) -> Optional[Dict[str, Any]]
             except Exception:
                 continue
 
-        # DOM fallbacks
         dom_name = await page.title()
         h1 = await page.query_selector("h1.product_title")
         if h1:
             dom_name = (await h1.inner_text()).strip()
 
-        # Price: handle normal + sale
         price_text = None
-        price_sel = [
-            "p.price ins span.woocommerce-Price-amount bdi",   # sale current
-            "p.price span.woocommerce-Price-amount bdi",       # normal
+        selectors = [
+            "p.price ins span.woocommerce-Price-amount bdi",
+            "p.price span.woocommerce-Price-amount bdi",
             "span.price span.woocommerce-Price-amount bdi",
         ]
-        for sel in price_sel:
+        for sel in selectors:
             el = await page.query_selector(sel)
             if el:
-                price_text = (await el.inner_text()).strip()
-                if price_text:
+                t = (await el.inner_text()).strip()
+                if t:
+                    price_text = t
                     break
 
-        # Image
         img_url = None
         img_el = await page.query_selector(".woocommerce-product-gallery__image img")
         if img_el:
             img_url = await img_el.get_attribute("src")
 
-        # Categories
         dom_categories: List[str] = []
         cat_els = await page.query_selector_all("span.posted_in a")
         if cat_els:
-            dom_categories = [(await c.inner_text()).strip() for c in cat_els if (await c.inner_text())]
+            dom_categories = [(await c.inner_text()).strip() for c in cat_els]
 
-        # Merge + normalize
         final_name = (json_data.get("name") or dom_name or "").strip()
 
         offers = json_data.get("offers", {})
@@ -251,7 +238,6 @@ async def extract_product_data(page: Page, url: str) -> Optional[Dict[str, Any]]
 
         currency = "FJD"
         final_price_raw = price_text
-
         if isinstance(offers, dict):
             if offers.get("price") is not None:
                 final_price_raw = str(offers.get("price"))
@@ -269,10 +255,13 @@ async def extract_product_data(page: Page, url: str) -> Optional[Dict[str, Any]]
 
         images: List[str] = []
         if json_data.get("image"):
-            img = json_data["image"]
+            img = json_data.get("image")
             images = img if isinstance(img, list) else [img]
         elif img_url:
             images = [img_url]
+
+        ts = datetime.now(timezone.utc).isoformat()
+        dedupe = generate_dedupe_key("mh", url)
 
         return {
             "source": "mh",
@@ -285,8 +274,8 @@ async def extract_product_data(page: Page, url: str) -> Optional[Dict[str, Any]]
             "categories": dom_categories,
             "images": images,
             "raw_html": html,
-            "scrape_timestamp": datetime.now(timezone.utc).isoformat(),
-            "dedupe_key": generate_dedupe_key("mh", url),
+            "scrape_timestamp": ts,
+            "dedupe_key": dedupe,
         }
 
     except Exception as e:
@@ -301,11 +290,24 @@ async def worker(sem: asyncio.Semaphore, context, url: str) -> None:
         page = await context.new_page()
         try:
             data = await extract_product_data(page, url)
-            if data:
-                await supabase_upsert("raw_products", data)
-                logger.info(f"Saved: {data['name'][:40]}... ({data.get('price_numeric')})")
-            else:
+            if not data:
                 logger.warning(f"Skipped: {url}")
+                return
+
+            await supabase_upsert_raw(data)
+
+            await supabase_insert_history({
+                "dedupe_key": data["dedupe_key"],
+                "source": data["source"],
+                "product_url": data["product_url"],
+                "name": data["name"],
+                "price_numeric": data["price_numeric"],
+                "currency": data["currency"],
+                "seen_at": data["scrape_timestamp"],
+            })
+
+            logger.info(f"Saved: {data['name'][:50]}... ({data.get('price_numeric')})")
+
         finally:
             await page.close()
 
@@ -314,7 +316,7 @@ async def worker(sem: asyncio.Semaphore, context, url: str) -> None:
 # -----------------------
 async def main() -> None:
     if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY env vars")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
@@ -327,30 +329,37 @@ async def main() -> None:
             viewport={"width": 1280, "height": 720},
         )
 
-        # 1) Discover categories
         page = await context.new_page()
+
         categories = await discover_categories(page)
 
-        # 2) Crawl categories -> product urls
         master_urls: Set[str] = set()
 
-        # Also crawl shop-wide pagination as a safety net (covers items missing from category lists)
+        # Safety net: crawl /shop/ pages too
         shop_urls = await crawl_paginated_listing(page, SHOP_URL)
         master_urls |= set(shop_urls)
         logger.info(f"After /shop crawl, master_urls={len(master_urls)}")
 
         for cat in categories:
-            cat_urls = await crawl_paginated_listing(page, cat)
-            master_urls |= set(cat_urls)
-            logger.info(f"After category, master_urls={len(master_urls)}")
+            try:
+                cat_urls = await crawl_paginated_listing(page, cat)
+                master_urls |= set(cat_urls)
+                logger.info(f"After category, master_urls={len(master_urls)}")
+            except Exception as e:
+                logger.error(f"Category crawl failed: {cat} :: {e}")
 
         await page.close()
 
-        logger.info(f"Total unique product URLs discovered: {len(master_urls)}")
+        urls = sorted(master_urls)
+        logger.info(f"Total unique product URLs discovered: {len(urls)}")
 
-        # 3) Extract + save concurrently
+        # Optional cap per run to avoid cancellations
+        if MH_MAX_PRODUCTS_PER_RUN > 0:
+            urls = urls[:MH_MAX_PRODUCTS_PER_RUN]
+            logger.info(f"Processing {len(urls)} products this run (MH_MAX_PRODUCTS_PER_RUN)")
+
         sem = asyncio.Semaphore(CONCURRENCY)
-        tasks = [worker(sem, context, u) for u in sorted(master_urls)]
+        tasks = [worker(sem, context, u) for u in urls]
         await asyncio.gather(*tasks)
 
         await browser.close()
